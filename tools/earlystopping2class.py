@@ -21,7 +21,7 @@ class EarlyStopping:
         self.F2 = 0
         self.F3 = 0
         self.F4 = 0
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
 
     def __call__(self, val_loss, accs,acc1,acc2,pre1,pre2,rec1,rec2,F1,F2,model,modelname,str):
 

@@ -1,8 +1,9 @@
 import sys,os
-sys.path.append(os.getcwd())
+# Use absolute path of the project root
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(project_root)
 from Process.process import *
 import torch as th
-from torch_scatter import scatter_mean
 import torch.nn.functional as F
 import numpy as np
 from tools.earlystopping2class import EarlyStopping
@@ -10,14 +11,90 @@ from torch_geometric.data import DataLoader
 from tqdm import tqdm
 from Process.rand5fold import *
 from tools.evaluate import *
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, MessagePassing
+from torch_geometric.utils import softmax, scatter
 import copy
+
+def scatter_mean(src, index, dim=0, dim_size=None):
+    return scatter(src, index, dim=dim, dim_size=dim_size, reduce='mean')
+
+class AlignmentAwareConv(MessagePassing):
+    def __init__(self, in_channels, out_channels):
+        super(AlignmentAwareConv, self).__init__(aggr='add')
+        self.lin = th.nn.Linear(in_channels, out_channels)
+        self.att = th.nn.Parameter(th.Tensor(1, 2 * out_channels + 1))
+        self.phi = th.nn.Linear(1, 1)
+        th.nn.init.xavier_uniform_(self.att)
+
+    def forward(self, x, edge_index):
+        h = self.lin(x)
+        return self.propagate(edge_index, x=x, h=h)
+
+    def message(self, x_i, x_j, h_i, h_j, edge_index_i):
+        # A(x_j, b_i) = cosine(x_j, b_i), assuming b_i = x_i (target node features)
+        a_ji = F.cosine_similarity(x_j, x_i, dim=-1).unsqueeze(-1)
+        
+        # I(x_j) = ||x_j||_1
+        i_j = th.norm(x_j, p=1, dim=-1).unsqueeze(-1)
+        i_j = th.clamp(i_j, min=1e-8)
+        
+        # s_ji = A(x_j, b_i) * (1 / I(x_j))
+        s_ji = a_ji / i_j
+        
+        phi_s = self.phi(s_ji)
+        # e_ij = LeakyReLU(a^T [Wh_i || Wh_j || phi(s_ji)])
+        e_ij = F.leaky_relu(th.matmul(th.cat([h_i, h_j, phi_s], dim=-1), self.att.t()))
+        alpha_ij = softmax(e_ij, edge_index_i)
+        
+        # Node Update: H_i = sum(alpha_ij * s_ji * H_j)
+        return alpha_ij * s_ji * h_j
+
+class KSFeatureExtractor(th.nn.Module):
+    def __init__(self, feature_dim, tau=0.5):
+        super(KSFeatureExtractor, self).__init__()
+        self.tau = tau
+        self.lambda1 = th.nn.Parameter(th.ones(1))
+        self.lambda2 = th.nn.Parameter(th.ones(1))
+        self.linear = th.nn.Linear(feature_dim, 64)
+
+    def forward(self, data):
+        x, edge_index, rootindex = data.x, data.edge_index, data.rootindex
+        batch_size = max(data.batch).item() + 1
+        ks_features = []
+        
+        for i in range(batch_size):
+            r_idx = rootindex[i]
+            x_r = x[r_idx].unsqueeze(0)
+            
+            mask = (edge_index[0] == r_idx)
+            children_indices = edge_index[1][mask]
+            
+            if len(children_indices) > 0:
+                x_c = x[children_indices]
+                sim = F.cosine_similarity(x_c, x_r, dim=-1)
+                r_align = (sim > self.tau).float().mean()
+                
+                child_set = set(children_indices.tolist())
+                internal_edges = 0
+                edges = edge_index.t()
+                for u, v in edges:
+                    if u.item() in child_set and v.item() in child_set:
+                        internal_edges += 1
+                r_density = internal_edges / len(children_indices)
+                
+                w_ks = self.lambda1 * r_align + self.lambda2 * r_density
+                z_ks = self.linear(x[r_idx])
+                ks_features.append(w_ks * z_ks)
+            else:
+                ks_features.append(th.zeros(64).to(x.device))
+                
+        return th.stack(ks_features)
 
 class TDrumorGCN(th.nn.Module):
     def __init__(self,in_feats,hid_feats,out_feats):
         super(TDrumorGCN, self).__init__()
-        self.conv1 = GCNConv(in_feats, hid_feats)
-        self.conv2 = GCNConv(hid_feats+in_feats, out_feats)
+        self.conv1 = AlignmentAwareConv(in_feats, hid_feats)
+        self.conv2 = AlignmentAwareConv(hid_feats+in_feats, out_feats)
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
@@ -46,8 +123,8 @@ class TDrumorGCN(th.nn.Module):
 class BUrumorGCN(th.nn.Module):
     def __init__(self,in_feats,hid_feats,out_feats):
         super(BUrumorGCN, self).__init__()
-        self.conv1 = GCNConv(in_feats, hid_feats)
-        self.conv2 = GCNConv(hid_feats+in_feats, out_feats)
+        self.conv1 = AlignmentAwareConv(in_feats, hid_feats)
+        self.conv2 = AlignmentAwareConv(hid_feats+in_feats, out_feats)
 
     def forward(self, data):
         x, edge_index = data.x, data.BU_edge_index
@@ -78,13 +155,24 @@ class Net(th.nn.Module):
         super(Net, self).__init__()
         self.TDrumorGCN = TDrumorGCN(in_feats, hid_feats, out_feats)
         self.BUrumorGCN = BUrumorGCN(in_feats, hid_feats, out_feats)
-        self.fc=th.nn.Linear((out_feats+hid_feats)*2,2)
+        self.KSFeatureExtractor = KSFeatureExtractor(in_feats)
+        
+        # LMF weights
+        self.W_td = th.nn.Linear(out_feats + hid_feats, 128)
+        self.W_bu = th.nn.Linear(out_feats + hid_feats, 128)
+        self.W_ks = th.nn.Linear(64, 128)
+        
+        self.fc = th.nn.Linear(128, 2)
 
     def forward(self, data):
         TD_x = self.TDrumorGCN(data)
         BU_x = self.BUrumorGCN(data)
-        x = th.cat((BU_x,TD_x), 1)
-        x=self.fc(x)
+        KS_x = self.KSFeatureExtractor(data)
+        
+        # LMF Fusion: Z = sum(W_m * Z_m)
+        x = self.W_td(TD_x) + self.W_bu(BU_x) + self.W_ks(KS_x)
+        
+        x = self.fc(x)
         x = F.log_softmax(x, dim=1)
         return x
 
@@ -104,9 +192,9 @@ def train_GCN(treeDic, x_test, x_train,TDdroprate,BUdroprate,lr, weight_decay,pa
     for epoch in range(n_epochs):
         traindata_list, testdata_list = loadBiData(dataname, treeDic, x_train, x_test, TDdroprate,BUdroprate)
         train_loader = DataLoader(traindata_list, batch_size=batchsize,
-                                  shuffle=False, num_workers=10)
+                                  shuffle=False, num_workers=0)
         test_loader = DataLoader(testdata_list, batch_size=batchsize,
-                                 shuffle=True, num_workers=10)
+                                 shuffle=True, num_workers=0)
         avg_loss,avg_acc = [],[]
         batch_idx = 0
         tqdm_train_loader = tqdm(train_loader)
@@ -190,87 +278,86 @@ def train_GCN(treeDic, x_test, x_train,TDdroprate,BUdroprate,lr, weight_decay,pa
             break
     return train_losses, val_losses, train_accs, val_accs, accs, acc1, pre1, rec1, F1, acc2, pre2, rec2, F2
 
-
-lr=0.0005
-weight_decay=1e-4
-patience=10
-n_epochs=200
-batchsize=16
-tddroprate=0
-budroprate=0
-datasetname="Weibo"
-iterations=int(sys.argv[1])
-model="BiGCN"
-device = th.device('cuda:1' if th.cuda.is_available() else 'cpu')
-test_accs,ACC1,ACC2,PRE1,PRE2,REC1,REC2,F1,F2 = [],[],[],[],[],[],[],[],[]
-for iter in range(iterations):
-    fold0_x_test, fold0_x_train,\
-    fold1_x_test, fold1_x_train, \
-    fold2_x_test, fold2_x_train,  \
-    fold3_x_test, fold3_x_train,  \
-    fold4_x_test, fold4_x_train = load5foldData(datasetname)
-    treeDic=loadTree(datasetname)
-    train_losses, val_losses, train_accs, val_accs, accs_0, acc1_0, pre1_0, rec1_0, F1_0, acc2_0, pre2_0, rec2_0, F2_0 = train_GCN(treeDic,
-                                                                                               fold0_x_test,
-                                                                                               fold0_x_train,
-                                                                                               tddroprate,budroprate,
-                                                                                               lr, weight_decay,
-                                                                                               patience,
-                                                                                               n_epochs,
-                                                                                               batchsize,
-                                                                                               datasetname,
-                                                                                               iter)
-    train_losses, val_losses, train_accs, val_accs,accs_1, acc1_1, pre1_1, rec1_1, F1_1, acc2_1, pre2_1, rec2_1, F2_1 = train_GCN(treeDic,
-                                                                                               fold1_x_test,
-                                                                                               fold1_x_train,
-                                                                                               tddroprate,budroprate, lr,
-                                                                                               weight_decay,
-                                                                                               patience,
-                                                                                               n_epochs,
-                                                                                               batchsize,
-                                                                                               datasetname,
-                                                                                               iter)
-    train_losses, val_losses, train_accs, val_accs, accs_2, acc1_2, pre1_2, rec1_2, F1_2, acc2_2, pre2_2, rec2_2, F2_2 = train_GCN(treeDic,
-                                                                                               fold2_x_test,
-                                                                                               fold2_x_train,
-                                                                                               tddroprate,budroprate, lr,
-                                                                                               weight_decay,
-                                                                                               patience,
-                                                                                               n_epochs,
-                                                                                               batchsize,
-                                                                                               datasetname,
-                                                                                               iter)
-    train_losses, val_losses, train_accs, val_accs, accs_3, acc1_3, pre1_3, rec1_3, F1_3, acc2_3, pre2_3, rec2_3, F2_3 = train_GCN(treeDic,
-                                                                                               fold3_x_test,
-                                                                                               fold3_x_train,
-                                                                                               tddroprate,budroprate, lr,
-                                                                                               weight_decay,
-                                                                                               patience,
+if __name__ == '__main__':
+    lr=0.0005
+    weight_decay=1e-4
+    patience=10
+    n_epochs=200
+    batchsize=16
+    tddroprate=0
+    budroprate=0
+    datasetname="Weibo"
+    iterations=int(sys.argv[1])
+    model_name="BiGCN"
+    device = th.device('cuda:0' if th.cuda.is_available() else 'cpu')
+    test_accs,ACC1,ACC2,PRE1,PRE2,REC1,REC2,F1,F2 = [],[],[],[],[],[],[],[],[]
+    for iter in range(iterations):
+        fold0_x_test, fold0_x_train,\
+        fold1_x_test, fold1_x_train, \
+        fold2_x_test, fold2_x_train,  \
+        fold3_x_test, fold3_x_train,  \
+        fold4_x_test, fold4_x_train = load5foldData(datasetname)
+        treeDic=loadTree(datasetname)
+        train_losses, val_losses, train_accs, val_accs, accs_0, acc1_0, pre1_0, rec1_0, F1_0, acc2_0, pre2_0, rec2_0, F2_0 = train_GCN(treeDic,
+                                                                                                   fold0_x_test,
+                                                                                                   fold0_x_train,
+                                                                                                   tddroprate,budroprate,
+                                                                                                   lr, weight_decay,
+                                                                                                   patience,
                                                                                                    n_epochs,
                                                                                                    batchsize,
                                                                                                    datasetname,
                                                                                                    iter)
-    train_losses, val_losses, train_accs, val_accs, accs_4, acc1_4, pre1_4, rec1_4, F1_4, acc2_4, pre2_4, rec2_4, F2_4 = train_GCN(treeDic,
-                                                                                               fold4_x_test,
-                                                                                               fold4_x_train,
-                                                                                               tddroprate,budroprate, lr,
-                                                                                               weight_decay,
-                                                                                               patience,
-                                                                                               n_epochs,
-                                                                                               batchsize,
-                                                                                               datasetname,
-                                                                                               iter)
-    test_accs.append((accs_0+accs_1+accs_2+accs_3+accs_4)/5)
-    ACC1.append((acc1_0 + acc1_1 + acc1_2 + acc1_3 + acc1_4) / 5)
-    ACC2.append((acc2_0 + acc2_1 +acc2_2 + acc2_3 +acc2_4) / 5)
-    PRE1.append((pre1_0 + pre1_1 + pre1_2 + pre1_3 + pre1_4) / 5)
-    PRE2.append((pre2_0 + pre2_1 + pre2_2 + pre2_3 + pre2_4) / 5)
-    REC1.append((rec1_0 + rec1_1 + rec1_2 + rec1_3 + rec1_4) / 5)
-    REC2.append((rec2_0 + rec2_1 + rec2_2 + rec2_3 + rec2_4) / 5)
-    F1.append((F1_0+F1_1+F1_2+F1_3+F1_4)/5)
-    F2.append((F2_0 + F2_1 + F2_2 + F2_3 + F2_4) / 5)
-print("weibo:|Total_Test_ Accuracy: {:.4f}|acc1: {:.4f}|acc2: {:.4f}|pre1: {:.4f}|pre2: {:.4f}"
-                  "|rec1: {:.4f}|rec2: {:.4f}|F1: {:.4f}|F2: {:.4f}".format(sum(test_accs) / iterations, sum(ACC1) / iterations,
-                                                                            sum(ACC2) / iterations, sum(PRE1) / iterations, sum(PRE2) /iterations,
-                                                                            sum(REC1) / iterations, sum(REC2) / iterations, sum(F1) / iterations, sum(F2) / iterations))
-
+        train_losses, val_losses, train_accs, val_accs,accs_1, acc1_1, pre1_1, rec1_1, F1_1, acc2_1, pre2_1, rec2_1, F2_1 = train_GCN(treeDic,
+                                                                                                   fold1_x_test,
+                                                                                                   fold1_x_train,
+                                                                                                   tddroprate,budroprate, lr,
+                                                                                                   weight_decay,
+                                                                                                   patience,
+                                                                                                   n_epochs,
+                                                                                                   batchsize,
+                                                                                                   datasetname,
+                                                                                                   iter)
+        train_losses, val_losses, train_accs, val_accs, accs_2, acc1_2, pre1_2, rec1_2, F1_2, acc2_2, pre2_2, rec2_2, F2_2 = train_GCN(treeDic,
+                                                                                                   fold2_x_test,
+                                                                                                   fold2_x_train,
+                                                                                                   tddroprate,budroprate, lr,
+                                                                                                   weight_decay,
+                                                                                                   patience,
+                                                                                                   n_epochs,
+                                                                                                   batchsize,
+                                                                                                   datasetname,
+                                                                                                   iter)
+        train_losses, val_losses, train_accs, val_accs, accs_3, acc1_3, pre1_3, rec1_3, F1_3, acc2_3, pre2_3, rec2_3, F2_3 = train_GCN(treeDic,
+                                                                                                   fold3_x_test,
+                                                                                                   fold3_x_train,
+                                                                                                   tddroprate,budroprate, lr,
+                                                                                                   weight_decay,
+                                                                                                   patience,
+                                                                                                       n_epochs,
+                                                                                                       batchsize,
+                                                                                                       datasetname,
+                                                                                                       iter)
+        train_losses, val_losses, train_accs, val_accs, accs_4, acc1_4, pre1_4, rec1_4, F1_4, acc2_4, pre2_4, rec2_4, F2_4 = train_GCN(treeDic,
+                                                                                                   fold4_x_test,
+                                                                                                   fold4_x_train,
+                                                                                                   tddroprate,budroprate, lr,
+                                                                                                   weight_decay,
+                                                                                                   patience,
+                                                                                                   n_epochs,
+                                                                                                   batchsize,
+                                                                                                   datasetname,
+                                                                                                   iter)
+        test_accs.append((accs_0+accs_1+accs_2+accs_3+accs_4)/5)
+        ACC1.append((acc1_0 + acc1_1 + acc1_2 + acc1_3 + acc1_4) / 5)
+        ACC2.append((acc2_0 + acc2_1 +acc2_2 + acc2_3 +acc2_4) / 5)
+        PRE1.append((pre1_0 + pre1_1 + pre1_2 + pre1_3 + pre1_4) / 5)
+        PRE2.append((pre2_0 + pre2_1 + pre2_2 + pre2_3 + pre2_4) / 5)
+        REC1.append((rec1_0 + rec1_1 + rec1_2 + rec1_3 + rec1_4) / 5)
+        REC2.append((rec2_0 + rec2_1 + rec2_2 + rec2_3 + rec2_4) / 5)
+        F1.append((F1_0+F1_1+F1_2+F1_3+F1_4)/5)
+        F2.append((F2_0 + F2_1 + F2_2 + F2_3 + F2_4) / 5)
+    print("weibo:|Total_Test_ Accuracy: {:.4f}|acc1: {:.4f}|acc2: {:.4f}|pre1: {:.4f}|pre2: {:.4f}"
+                      "|rec1: {:.4f}|rec2: {:.4f}|F1: {:.4f}|F2: {:.4f}".format(sum(test_accs) / iterations, sum(ACC1) / iterations,
+                                                                                sum(ACC2) / iterations, sum(PRE1) / iterations, sum(PRE2) /iterations,
+                                                                                sum(REC1) / iterations, sum(REC2) / iterations, sum(F1) / iterations, sum(F2) / iterations))

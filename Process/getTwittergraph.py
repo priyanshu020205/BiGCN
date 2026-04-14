@@ -4,7 +4,10 @@ import numpy as np
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import sys
-cwd=os.getcwd()
+
+# Use absolute path of the project root
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 class Node_tweet(object):
     def __init__(self, idx=None):
         self.children = []
@@ -72,7 +75,7 @@ def getfeature(x_word,x_index):
     return x
 
 def main(obj):
-    treePath = os.path.join(cwd, 'data/' + obj + '/data.TD_RvNN.vol_5000.txt')
+    treePath = os.path.join(project_root, 'data/' + obj + '/data.TD_RvNN.vol_5000.txt')
     print("reading twitter tree")
     treeDic = {}
     for line in open(treePath):
@@ -85,7 +88,7 @@ def main(obj):
         treeDic[eid][indexC] = {'parent': indexP, 'max_degree': max_degree, 'maxL': maxL, 'vec': Vec}
     print('tree no:', len(treeDic))
 
-    labelPath = os.path.join(cwd, "data/" + obj + "/" + obj + "_label_All.txt")
+    labelPath = os.path.join(project_root, "data/" + obj + "/" + obj + "_label_All.txt")
     labelset_nonR, labelset_f, labelset_t, labelset_u = ['news', 'non-rumor'], ['false'], ['true'], ['unverified']
 
     print("loading tree label")
@@ -122,7 +125,7 @@ def main(obj):
             x_x = getfeature(x_word, x_index)
             rootfeat, tree, x_x, rootindex, y = np.array(rootfeat), np.array(tree), np.array(x_x), np.array(
                 rootindex), np.array(y)
-            np.savez( os.path.join(cwd, 'data/'+obj+'graph/'+id+'.npz'), x=x_x,root=rootfeat,edgeindex=tree,rootindex=rootindex,y=y)
+            np.savez( os.path.join(project_root, 'data/'+obj+'graph/'+id+'.npz'), x=x_x,root=rootfeat,edgeindex=tree,rootindex=rootindex,y=y)
             return None
     print("loading dataset", )
     Parallel(n_jobs=30, backend='threading')(delayed(loadEid)(treeDic[eid] if eid in treeDic else None,eid,labelDic[eid]) for eid in tqdm(event))

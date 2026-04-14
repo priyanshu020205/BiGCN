@@ -2,11 +2,12 @@ import random
 from random import shuffle
 import os
 
-cwd=os.getcwd()
+# Use absolute path of the project root
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def load5foldData(obj):
     if 'Twitter' in obj:
-        labelPath = os.path.join(cwd,"data/" +obj+"/"+ obj + "_label_All.txt")
+        labelPath = os.path.join(project_root,"data/" +obj+"/"+ obj + "_label_All.txt")
         labelset_nonR, labelset_f, labelset_t, labelset_u = ['news', 'non-rumor'], ['false'], ['true'], ['unverified']
         print("loading tree label" )
         NR,F,T,U = [],[],[],[]
@@ -100,7 +101,7 @@ def load5foldData(obj):
         fold4_x_test.extend(U[leng4*4:leng4*5])
 
     if obj == "Weibo":
-        labelPath = os.path.join(cwd,"data/Weibo/weibo_id_label.txt")
+        labelPath = os.path.join(project_root,"data/Weibo/weibo_id_label.txt")
         print("loading weibo label:")
         F, T = [], []
         l1 = l2 = 0
